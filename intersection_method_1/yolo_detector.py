@@ -1,18 +1,17 @@
 from ultralytics import YOLO
 import numpy as np
-
+import torch
 class YOLOv8Detector:
-    def __init__(self, model_path='yolov8n.pt', device='cpu', conf=0.3):
-        self.model = YOLO(model_path)
+    def __init__(self):
+        # Load model and send to GPU if available
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        self.model = YOLO('yolov8n.pt')
+        self.model.to(device)
         self.device = device
-        self.conf = conf
 
-    def detect(self, image):
-        """
-        Run YOLOv8 detection on an image.
-        Returns a list of dicts: {'bbox': (x, y, w, h), 'conf': float, 'cls': int}
-        """
-        results = self.model(image, device=self.device, conf=self.conf)
+    def detect(self, frame):
+        results = self.model.predict(frame, device=self.device,conf=0.6)  # Force device each call
         detections = []
         for r in results:
             for box in r.boxes:
