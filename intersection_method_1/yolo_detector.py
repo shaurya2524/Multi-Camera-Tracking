@@ -11,7 +11,7 @@ class YOLOv8Detector:
         self.device = device
 
     def detect(self, frame):
-        results = self.model.predict(frame, device=self.device,conf=0.6)  # Force device each call
+        results = self.model.predict(frame, device=self.device,conf=0.7)  # Force device each call
         detections = []
         for r in results:
             for box in r.boxes:
