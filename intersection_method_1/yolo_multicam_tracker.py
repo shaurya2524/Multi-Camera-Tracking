@@ -69,12 +69,12 @@ class YoloMultiCameraTracker:
                 center = (x + w // 2, y + h // 2)
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.circle(frame, center, 5, (0, 0, 255), -1)
-                cv2.putText(frame, f'ID: {track_id}', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # cv2.putText(frame, f'ID: {track_id}', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             if union_frame is not None:
                 center = track['last_position']
                 cv2.circle(union_frame, center, 8, (0, 0, 255), -1)
-                cv2.putText(union_frame, f'ID: {track_id}', (center[0] + 10, center[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                # cv2.putText(union_frame, f'ID: {track_id}', (center[0] + 10, center[1] - 10),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cam_color = (255, 0, 0) if track['camera'] == 1 else (0, 255, 255)
-                cv2.putText(union_frame, f'Cam{track["camera"]}', (center[0] + 10, center[1] + 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, cam_color, 1) 
+                # cv2.putText(union_frame, f'Cam{track["camera"]}', (center[0] + 10, center[1] + 10),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, cam_color, 1) 
