@@ -19,26 +19,22 @@ class EnhancedTrackingPipeline:
         # Original components
         self.detector = YOLOv8Detector()
         self.tracker = YoloMultiCameraTracker()
-        
-        # New Global ID Manager
         self.global_id_manager = GlobalIDManager(
-            distance_threshold=50.0,  # Adjust based on your camera setup
+            distance_threshold=50.0,
             confidence_threshold=0.6,
-            max_missing_frames=30,
+            max_missing_frames=50,
             min_track_length=5,
             merge_iou_threshold=0.3
         )
-        
+
         self.recording = False
         self.output_writer = None
+        self.combined_writer = None   # <-- FIX: initialize combined writer
         self.frame_count = 0
-        
-        # Store last detections for extraction
         self.last_detections1 = []
         self.last_detections2 = []
-        
-        # Initialize homography for global coordinate system
         self._setup_homography()
+
         
     def _setup_homography(self):
         """Setup homography matrix for global coordinate transformation"""
@@ -113,6 +109,13 @@ class EnhancedTrackingPipeline:
         
         print(f"Camera {camera_id} final detections: {len(detections)}")
         return detections
+    def is_near_boundary(self, bbox, frame, margin=50):
+        """Check if a bounding box is close to the border of the frame"""
+        x, y, w, h = map(int, bbox)  # ensure scalars
+        H, W = frame.shape[:2]
+        return (x < margin) or (y < margin) or (x + w > W - margin) or (y + h > H - margin)
+
+
     
     def setup_recording(self, output_path, fps, width, height):
         """Setup video recording"""
@@ -122,71 +125,67 @@ class EnhancedTrackingPipeline:
         print(f"Recording to {output_path}")
     
     def process_frame(self, frame1, frame2):
-        """Enhanced frame processing with global ID management - FIXED VERSION"""
+        """Enhanced frame processing with global ID management and boundary-based motion tracking"""
         self.frame_count += 1
-        
         print(f"\n--- Processing Frame {self.frame_count} ---")
-        
-        # Original detection and tracking
+
+        # 1. Run YOLO detections
         detections1 = self.detector.detect(frame1)
         detections2 = self.detector.detect(frame2)
-        
+
         # Store detections for fallback extraction
         self.last_detections1 = detections1
         self.last_detections2 = detections2
-        
-        # DEBUG: Check detection format
-        print(f"Detection1 type: {type(detections1)}, length: {len(detections1) if detections1 else 0}")
-        print(f"Detection2 type: {type(detections2)}, length: {len(detections2) if detections2 else 0}")
-        if detections1:
-            print(f"First detection1: {detections1[0] if len(detections1) > 0 else 'None'}")
-        if detections2:
-            print(f"First detection2: {detections2[0] if len(detections2) > 0 else 'None'}")
-        
+
         print(f"YOLO Detections - Cam1: {len(detections1)}, Cam2: {len(detections2)}")
-        
-        # Update your existing tracker
+
+        # 2. Update single-camera tracker
         self.tracker.update(detections1, detections2)
         print("Tracker updated")
-        
-        # DEBUG: Print tracker state
-        if hasattr(self.tracker, 'tracks'):
-            print(f"Tracker tracks available: {len(self.tracker.tracks) if self.tracker.tracks else 0}")
-        
-        # Extract detections for global ID processing
+
+        # 3. Extract detections for global ID manager
         camera_detections = {
             1: self.extract_tracker_detections(1),
             2: self.extract_tracker_detections(2)
         }
-        
         print(f"Extracted for Global ID - Cam1: {len(camera_detections[1])}, Cam2: {len(camera_detections[2])}")
-        
-        # Debug: Print first few detections
-        for cam_id, dets in camera_detections.items():
-            if dets:
-                print(f"  Cam{cam_id} first detection: {dets[0]}")
-        
-        # Process with global ID manager
+
+        # 4. Process with global ID manager (initial pass)
         global_tracks = self.global_id_manager.process_detections(camera_detections)
         print(f"Global tracks after processing: {len(global_tracks)}")
-        
-        # Create union frame
+
+        # 5. Create union view (needed for boundary checks)
         union_frame = self.create_union_frame(frame1, frame2)
-        
-        # Draw original tracks
+
+        # 6. Boundary-based re-ID (motion tracker correction)
+        for cam_id, dets in camera_detections.items():
+            for det in dets:
+                local_id, bbox, conf = det
+                if self.is_near_boundary(bbox, union_frame):
+                    matched_id = self.global_id_manager.match_with_predictions(bbox)
+                    if matched_id:
+                        print(f"[Boundary Motion Tracker] Re-using Global ID {matched_id}")
+                        self.global_id_manager.assign_existing_id(
+                            matched_id,
+                            self.global_id_manager.create_detection(cam_id, local_id, bbox, conf),
+                            cam_id
+                        )
+
+        # 7. Draw tracker overlays
         self.tracker.draw_tracks(frame1, 1)
         self.tracker.draw_tracks(frame2, 2)
         self.tracker.draw_tracks(None, None, union_frame)
-        
-        # Enhance with global IDs
+
+        # 8. Draw global overlays
         self.draw_global_id_overlay(frame1, 1, global_tracks)
         self.draw_global_id_overlay(frame2, 2, global_tracks)
         self.draw_global_tracks_union(union_frame, global_tracks)
-        
-        # Add enhanced info overlay
+
+        # 9. Add info overlays
         self.add_enhanced_info_overlay(union_frame, global_tracks)
-        
+
         return frame1, frame2, union_frame
+
     
     def create_union_frame(self, frame1, frame2):
         """Create union frame from two camera views"""
@@ -358,15 +357,22 @@ class EnhancedTrackingPipeline:
                 
                 # Process frames with global ID tracking
                 tracked_frame1, tracked_frame2, union_frame = self.process_frame(frame1, frame2)
+
+                # Concatenate tracked_frame1 and tracked_frame2 side by side
+                combined_frame = cv2.hconcat([tracked_frame1, tracked_frame2])
                 
                 # Record if enabled
-                if self.recording and self.output_writer:
-                    self.output_writer.write(union_frame)
+                if self.recording:
+                    if self.output_writer:
+                        self.output_writer.write(union_frame)
+                    if self.combined_writer:
+                        self.combined_writer.write(combined_frame)
             
             # Display frames
             cv2.imshow('Camera 1 - Enhanced Tracking', tracked_frame1)
             cv2.imshow('Camera 2 - Enhanced Tracking', tracked_frame2)
             cv2.imshow('Union - Global ID Tracking', union_frame)
+            cv2.imshow('Combined Side-by-Side', combined_frame)
             
             # Handle keyboard input
             key = cv2.waitKey(int(1000/fps)) & 0xFF
@@ -378,30 +384,52 @@ class EnhancedTrackingPipeline:
                 print(f"{'Paused' if paused else 'Resumed'}")
             elif key == ord('r'):
                 if not self.recording:
-                    h, w = union_frame.shape[:2]
-                    self.setup_recording('enhanced_tracking_output.mp4', fps, w, h)
+                    h_union, w_union = union_frame.shape[:2]
+                    self.setup_recording('enhanced_tracking_output.mp4', fps, w_union, h_union)
+
+                    # Use actual combined_frame dimensions
+                    combined_frame = cv2.hconcat([tracked_frame1, tracked_frame2])
+                    h_comb, w_comb = combined_frame.shape[:2]
+                    self.combined_writer = cv2.VideoWriter(
+                        'combined_output.mp4',
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        fps,
+                        (w_comb, h_comb)
+                    )
+
+                    self.recording = True
+                    print("Recording started")
                 else:
                     self.recording = False
                     if self.output_writer:
                         self.output_writer.release()
+                        self.output_writer = None
+                    if self.combined_writer:
+                        self.combined_writer.release()
+                        self.combined_writer = None
                     print("Recording stopped")
+
+
             elif key == ord('s'):
                 self.print_tracking_statistics()
             elif key == ord('c'):
-                # Clear old tracks (useful for long videos)
                 old_count = len(self.global_id_manager.global_tracks)
                 self.global_id_manager._cleanup_old_tracks()
                 new_count = len(self.global_id_manager.global_tracks)
                 print(f"Cleared {old_count - new_count} old tracks")
             elif key == ord('d'):
                 self.debug_tracker_state()
+
         
         # Cleanup
         cap1.release()
         cap2.release()
         if self.output_writer:
             self.output_writer.release()
+        if self.combined_writer:
+            self.combined_writer.release()
         cv2.destroyAllWindows()
+
         
         # Print final statistics
         print("\n=== Final Tracking Session Summary ===")

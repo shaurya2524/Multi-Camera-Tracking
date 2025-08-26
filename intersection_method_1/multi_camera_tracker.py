@@ -13,6 +13,8 @@ from typing import Dict, List, Tuple, Optional, Set
 from dataclasses import dataclass
 from scipy.spatial.distance import cdist
 import cv2
+from typing import Dict, List, Tuple, Set
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -31,12 +33,44 @@ class Detection:
 class GlobalTrack:
     """Represents a global track across multiple cameras"""
     global_id: int
-    camera_detections: Dict[int, Detection]  # camera_id -> Detection
+    camera_detections: Dict[int, "Detection"]   # camera_id -> Detection
     last_seen: float
     creation_time: float
     confidence_history: List[float]
     position_history: List[Tuple[float, float]]
     active_cameras: Set[int]
+
+    # === NEW: Kalman filter field (ignored by dataclass repr/eq) ===
+    kalman: cv2.KalmanFilter = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        """Initialize Kalman filter for motion prediction"""
+        self.kalman = cv2.KalmanFilter(4, 2)  # state=[x, y, dx, dy], measurement=[x, y]
+        
+        # Measurement matrix (we measure position)
+        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0],
+                                                [0, 1, 0, 0]], np.float32)
+        
+        # Transition matrix (predict next pos using velocity)
+        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+                                                [0, 1, 0, 1],
+                                                [0, 0, 1, 0],
+                                                [0, 0, 0, 1]], np.float32)
+        
+        # Process noise: higher for velocity to allow acceleration
+        self.kalman.processNoiseCov = np.array([[1, 0, 0, 0],
+                                                [0, 1, 0, 0],
+                                                [0, 0, 10, 0],
+                                                [0, 0, 0, 10]], np.float32)
+        
+        # Measurement noise: smooth detection jitter
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 5.0
+
+        # Initialize state with first known position
+        if self.position_history:
+            cx, cy = self.position_history[-1]
+            self.kalman.statePre = np.array([[cx], [cy], [0], [0]], np.float32)
+            self.kalman.statePost = np.array([[cx], [cy], [0], [0]], np.float32)
 
 
 class GlobalIDManager:
@@ -146,17 +180,31 @@ class GlobalIDManager:
         ref_center = self.transform_point_to_reference(detection.center, detection.camera_id)
         
         for global_id, track in self.global_tracks.items():
-            # Skip if track is from the same camera (shouldn't happen in normal flow)
+            # Skip if track is from the same camera
             if detection.camera_id in track.active_cameras:
                 continue
-            
-            # Get the most recent position from track history
+
             if track.position_history:
                 track_center = track.position_history[-1]
+
+                # Use predicted position if available
+                if hasattr(track, "predicted_position") and track.predicted_position is not None:
+                    track_center = track.predicted_position
+
+                # --- Adaptive distance threshold based on velocity ---
+                # Get predicted velocity from Kalman filter
+                vx, vy = 0.0, 0.0
+                if hasattr(track, "kalman") and track.kalman is not None:
+                    prediction = track.kalman.predict()
+                    vx, vy = prediction[2, 0], prediction[3, 0]
+
+                adaptive_threshold = self.distance_threshold + np.hypot(vx, vy) * 1.5
+
                 distance = self.calculate_distance(ref_center, track_center)
-                
-                if distance <= self.distance_threshold:
+
+                if distance <= adaptive_threshold:
                     matches.append((global_id, distance))
+
         
         # Sort by distance (closest first)
         matches.sort(key=lambda x: x[1])
@@ -183,21 +231,26 @@ class GlobalIDManager:
     
     def update_global_track(self, track: GlobalTrack, detection: Detection):
         """Update existing global track with new detection"""
-        # Update detection for this camera
         track.camera_detections[detection.camera_id] = detection
         track.active_cameras.add(detection.camera_id)
         track.last_seen = detection.timestamp
-        
+
         # Update history
         track.confidence_history.append(detection.confidence)
         ref_center = self.transform_point_to_reference(detection.center, detection.camera_id)
         track.position_history.append(ref_center)
-        
-        # Limit history length to prevent memory issues
+
+        # Limit history
         max_history = 50
         if len(track.confidence_history) > max_history:
             track.confidence_history = track.confidence_history[-max_history:]
             track.position_history = track.position_history[-max_history:]
+
+        # === NEW: Kalman filter correction ===
+        cx, cy = ref_center
+        measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
+        track.kalman.correct(measurement)
+
     
     def process_detections(self, camera_detections: Dict[int, List[Tuple]]) -> Dict[int, GlobalTrack]:
         """
@@ -240,7 +293,18 @@ class GlobalIDManager:
         for detection in unmatched_detections:
             new_track = self.create_new_global_track(detection)
             self.global_tracks[new_track.global_id] = new_track
-        
+        for global_id, track in self.global_tracks.items():
+            frames_missing = self.frame_count - track.last_seen
+            if frames_missing > 0 and frames_missing <= self.max_missing_frames:
+                # Predict next position
+                prediction = track.kalman.predict()
+                pred_x, pred_y = float(prediction[0]), float(prediction[1])
+                # Store predicted position for matching
+                track.predicted_position = (pred_x, pred_y)
+            else:
+                track.predicted_position = None
+
+
         # Clean up old tracks
         self._cleanup_old_tracks()
         
@@ -363,6 +427,31 @@ class GlobalIDManager:
             stats['tracks_per_camera'][f'camera_{camera_id}'] = count
         
         return stats
+    def match_with_predictions(self, bbox, threshold: float = 50):
+        """Try to match a new detection with predicted track positions"""
+        x, y, w, h = bbox
+        cx, cy = x + w//2, y + h//2
+
+        for global_id, track in self.global_tracks.items():
+            prediction = track.kalman.predict()
+            pred_x, pred_y = int(prediction[0]), int(prediction[1])
+            dist = np.hypot(cx - pred_x, cy - pred_y)
+            if dist < threshold:
+                return global_id
+        return None
+
+    def assign_existing_id(self, global_id: int, detection: "Detection", camera_id: int):
+        """Force-assign detection to an existing track"""
+        track = self.global_tracks[global_id]
+        track.camera_detections[camera_id] = detection
+        track.active_cameras.add(camera_id)
+        track.last_seen = detection.timestamp
+
+        # Correct Kalman filter
+        cx, cy = self.transform_point_to_reference(detection.center, camera_id)
+        measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
+        track.kalman.correct(measurement)
+
 
 
 # Example usage and testing
