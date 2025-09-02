@@ -6,12 +6,12 @@ class YOLOv8Detector:
         # Load model and send to GPU if available
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {device}")
-        self.model = YOLO('yolov8n.pt')
+        self.model = YOLO('yolo11n.pt')
         self.model.to(device)
         self.device = device
 
     def detect(self, frame):
-        results = self.model.predict(frame, device=self.device,conf=0.7)  # Force device each call
+        results = self.model.predict(frame, device="cuda",conf=0.5)  # Force device each call
         detections = []
         for r in results:
             for box in r.boxes:
