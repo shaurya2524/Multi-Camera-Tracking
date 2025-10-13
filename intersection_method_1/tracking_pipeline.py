@@ -9,9 +9,12 @@ import os
 import cv2
 import numpy as np
 import argparse
-from yolo_detector import YOLOv8Detector
-from yolo_multicam_tracker import YoloMultiCameraTracker
-from multi_camera_tracker import GlobalIDManager
+import sys
+sys.path.append('src')
+
+from src.detectors.yolo_detector import YOLOv8Detector
+from src.trackers.yolo_multicam_tracker import YoloMultiCameraTracker
+from src.trackers.multi_camera_tracker import GlobalIDManager
 
 
 class EnhancedTrackingPipeline:

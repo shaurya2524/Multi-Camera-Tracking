@@ -3,7 +3,7 @@ import numpy as np
 from shapely.geometry import Polygon
 import json
 import time
-
+from shapely.validation import make_valid, explain_validity
 class ViewUnion:
     def __init__(self):
         self.homography = None
@@ -15,7 +15,7 @@ class ViewUnion:
         h1, w1 = frame1_shape[:2]
         h2, w2 = frame2_shape[:2]
         
-        # Get corners of frame1
+        # Frame1 corners
         corners1 = np.array([[0, 0], [w1, 0], [w1, h1], [0, h1]], dtype=np.float32)
         
         # Transform corners using homography
@@ -23,16 +23,32 @@ class ViewUnion:
         warped_corners = warped_corners.reshape(-1, 2)
         
         # Frame2 corners
-        corners2 = np.array([[0, 0], [w2, 0], [w2, h2], [0, h2]])
+        corners2 = np.array([[0, 0], [w2, 0], [w2, h2], [0, h2]], dtype=np.float32)
         
-        # Calculate intersection using Shapely
+        # Build polygons
         poly1 = Polygon(warped_corners)
         poly2 = Polygon(corners2)
         
+        # --- Fix invalid polygons ---
+        if not poly1.is_valid:
+            print("Fixing poly1:", explain_validity(poly1))
+            try:
+                poly1 = make_valid(poly1)
+            except Exception:
+                poly1 = poly1.buffer(0)  # fallback
+        
+        if not poly2.is_valid:
+            print("Fixing poly2:", explain_validity(poly2))
+            try:
+                poly2 = make_valid(poly2)
+            except Exception:
+                poly2 = poly2.buffer(0)  # fallback
+        
+        # Compute intersection
         intersection = poly1.intersection(poly2)
         
         if intersection.is_empty:
-            return None, 0
+            return None, 0.0
         
         return intersection, intersection.area
     
