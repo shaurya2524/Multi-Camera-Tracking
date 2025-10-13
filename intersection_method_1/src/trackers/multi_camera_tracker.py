@@ -29,6 +29,152 @@ class Detection:
     timestamp: float
 
 
+class AMCTracker:
+    """
+    Minimal AMC-based motion predictor that mimics the Kalman API.
+    predict() -> returns np.array shape (4,1): [x, y, vx, vy]^T
+    correct(measurement) -> accepts measurement (2x1) and does light bookkeeping.
+    """
+
+    def __init__(self, track_ref, max_absorbing_history: int = 5):
+        self.track_ref = track_ref  # reference to GlobalTrack
+        self.max_absorbing_history = max_absorbing_history
+        # internal last prediction (for stability)
+        self._last_pred = None
+
+    def _build_candidates(self, last_pos, speed_est):
+        """
+        Build a small candidate grid around last_pos.
+        Use step proportional to speed_est (but at least a minimum).
+        Return list of (x,y) candidate coordinates.
+        """
+        min_step = 5.0
+        step = max(min_step, speed_est * 1.5)
+        offsets = [-step, 0.0, step]
+        candidates = []
+        for dx in offsets:
+            for dy in offsets:
+                candidates.append((last_pos[0] + dx, last_pos[1] + dy))
+        # ensure unique
+        uniq = []
+        seen = set()
+        for c in candidates:
+            key = (round(c[0], 3), round(c[1], 3))
+            if key not in seen:
+                seen.add(key)
+                uniq.append(c)
+        return uniq
+
+    def predict(self):
+        """
+        Predict next [x,y,vx,vy] using a tiny AMC over candidate points.
+        Returns shape (4,1) numpy array to match Kalman usage.
+        """
+        positions = self.track_ref.position_history
+        if not positions:
+            # no history -> return zeros
+            arr = np.zeros((4, 1), dtype=np.float32)
+            return arr
+
+        last = positions[-1]
+        # estimate speed from last two positions if available
+        if len(positions) >= 2:
+            prev = positions[-2]
+            vx_est = last[0] - prev[0]
+            vy_est = last[1] - prev[1]
+            speed_est = np.hypot(vx_est, vy_est)
+        else:
+            vx_est, vy_est = 0.0, 0.0
+            speed_est = 0.0
+
+        # Build candidate transient nodes (small grid around last)
+        candidates = self._build_candidates(last, speed_est)
+        m = len(candidates)
+
+        # Absorbing nodes: past few positions (considered 'background' targets to be avoided)
+        absorbing_nodes = list(reversed(positions[:-0]))  # all historic positions
+        # limit absorbing length
+        absorbing_nodes = absorbing_nodes[-self.max_absorbing_history:]
+        a = len(absorbing_nodes)
+        if a == 0:
+            # if no absorbing nodes (rare), fallback to returning last+velocity
+            pred_x = last[0] + vx_est
+            pred_y = last[1] + vy_est
+            arr = np.array([[pred_x], [pred_y], [vx_est], [vy_est]], dtype=np.float32)
+            self._last_pred = arr
+            return arr
+
+        # Compute transition weights (transient->transient and transient->absorbing)
+        # Use Gaussian kernel on Euclidean distances
+        sigma_t = max(1.0, speed_est + 1.0)
+        sigma_a = max(1.0, speed_est + 1.0)
+
+        # Q: m x m, R: m x a
+        Q = np.zeros((m, m), dtype=np.float64)
+        R = np.zeros((m, a), dtype=np.float64)
+        for i in range(m):
+            ci = np.array(candidates[i])
+            # transient-transient
+            for j in range(m):
+                cj = np.array(candidates[j])
+                dist = np.linalg.norm(ci - cj)
+                Q[i, j] = np.exp(- (dist ** 2) / (2 * sigma_t ** 2))
+            # transient-absorbing
+            for k in range(a):
+                ak = np.array(absorbing_nodes[k])
+                dist = np.linalg.norm(ci - ak)
+                R[i, k] = np.exp(- (dist ** 2) / (2 * sigma_a ** 2))
+
+            # normalize row to sum to 1 (so it becomes a transition probability)
+            row_sum = Q[i].sum() + R[i].sum()
+            if row_sum > 0:
+                Q[i] /= row_sum
+                R[i] /= row_sum
+            else:
+                # rare: equally distribute
+                Q[i] = np.ones(m, dtype=np.float64) / m
+
+        # Q is now m x m transition among transient states
+        # Fundamental matrix F = (I - Q)^-1
+        I = np.eye(m, dtype=np.float64)
+        try:
+            F = np.linalg.inv(I - Q)
+        except np.linalg.LinAlgError:
+            # fallback to pseudoinverse for stability
+            F = np.linalg.pinv(I - Q)
+
+        # Standard absorption time (expected number of steps before absorption)
+        # t = F * 1 (vector of ones), but we want modified absorption time:
+        # compute expected number of visits to transient states before absorption:
+        t = F.sum(axis=1)  # shape (m,)
+
+        # Additionally compute expected visits to each absorbing node:
+        # B = F * R  -> B[i,k] = expected visits from transient i to absorbing k
+        B = F @ R  # (m x a)
+        # Choose candidate with maximal combined score: e.g., t (staying in transient) minus closeness to absorbing nodes
+        # We prefer candidates that visit foreground-like (i.e., avoid absorbing closish nodes)
+        # A simple score: score = t - alpha * sum(B[:,k] * w_k) where w_k gives weight to absorbing nodes (use distance)
+        # But to keep it simple and robust we'll choose candidate with maximum t (longer time before absorption => more foreground-like)
+        best_idx = int(np.argmax(t))
+        pred_x, pred_y = candidates[best_idx]
+
+        # velocity estimate
+        vx = pred_x - last[0]
+        vy = pred_y - last[1]
+
+        arr = np.array([[pred_x], [pred_y], [vx], [vy]], dtype=np.float32)
+        self._last_pred = arr
+        return arr
+
+    def correct(self, measurement):
+        """
+        Called when a measurement is available. We don't have an internal filter to correct,
+        because GlobalTrack.position_history is the canonical store. Keep as a no-op for now.
+        """
+        # No internal state which needs correction because we rely on position_history.
+        return
+
+
 @dataclass
 class GlobalTrack:
     """Represents a global track across multiple cameras"""
@@ -41,36 +187,13 @@ class GlobalTrack:
     active_cameras: Set[int]
 
     # === NEW: Kalman filter field (ignored by dataclass repr/eq) ===
-    kalman: cv2.KalmanFilter = field(init=False, repr=False, compare=False)
+    kalman: AMCTracker = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        """Initialize Kalman filter for motion prediction"""
-        self.kalman = cv2.KalmanFilter(4, 2)  # state=[x, y, dx, dy], measurement=[x, y]
-        
-        # Measurement matrix (we measure position)
-        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0],
-                                                [0, 1, 0, 0]], np.float32)
-        
-        # Transition matrix (predict next pos using velocity)
-        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0],
-                                                [0, 1, 0, 1],
-                                                [0, 0, 1, 0],
-                                                [0, 0, 0, 1]], np.float32)
-        
-        # Process noise: higher for velocity to allow acceleration
-        self.kalman.processNoiseCov = np.array([[1, 0, 0, 0],
-                                                [0, 1, 0, 0],
-                                                [0, 0, 10, 0],
-                                                [0, 0, 0, 10]], np.float32)
-        
-        # Measurement noise: smooth detection jitter
-        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 5.0
-
-        # Initialize state with first known position
-        if self.position_history:
-            cx, cy = self.position_history[-1]
-            self.kalman.statePre = np.array([[cx], [cy], [0], [0]], np.float32)
-            self.kalman.statePost = np.array([[cx], [cy], [0], [0]], np.float32)
+        """Initialize AMC-based tracker for motion prediction"""
+        # Replace Kalman filter with AMCTracker wrapper that implements predict() and correct()
+        # so other parts of your system using kalman.predict()/correct() continue to work.
+        self.kalman = AMCTracker(self)
 
 
 class GlobalIDManager:
@@ -192,11 +315,11 @@ class GlobalIDManager:
                     track_center = track.predicted_position
 
                 # --- Adaptive distance threshold based on velocity ---
-                # Get predicted velocity from Kalman filter
+                # Get predicted velocity from AMC 'kalman' (predict returns [x,y,vx,vy])
                 vx, vy = 0.0, 0.0
                 if hasattr(track, "kalman") and track.kalman is not None:
                     prediction = track.kalman.predict()
-                    vx, vy = prediction[2, 0], prediction[3, 0]
+                    vx, vy = float(prediction[2, 0]), float(prediction[3, 0])
 
                 adaptive_threshold = self.distance_threshold + np.hypot(vx, vy) * 1.5
 
@@ -246,7 +369,7 @@ class GlobalIDManager:
             track.confidence_history = track.confidence_history[-max_history:]
             track.position_history = track.position_history[-max_history:]
 
-        # === NEW: Kalman filter correction ===
+        # === NEW: AMC-based 'correct' (kept for API compatibility) ===
         cx, cy = ref_center
         measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
         track.kalman.correct(measurement)
@@ -296,7 +419,7 @@ class GlobalIDManager:
         for global_id, track in self.global_tracks.items():
             frames_missing = self.frame_count - track.last_seen
             if frames_missing > 0 and frames_missing <= self.max_missing_frames:
-                # Predict next position
+                # Predict next position using AMCTracker
                 prediction = track.kalman.predict()
                 pred_x, pred_y = float(prediction[0]), float(prediction[1])
                 # Store predicted position for matching
@@ -447,7 +570,7 @@ class GlobalIDManager:
         track.active_cameras.add(camera_id)
         track.last_seen = detection.timestamp
 
-        # Correct Kalman filter
+        # Correct AMC-based tracker (API compatible)
         cx, cy = self.transform_point_to_reference(detection.center, camera_id)
         measurement = np.array([[np.float32(cx)], [np.float32(cy)]])
         track.kalman.correct(measurement)

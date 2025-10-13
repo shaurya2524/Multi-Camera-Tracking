@@ -1,0 +1,69 @@
+# Multi-Camera Tracking System Configuration
+
+# Object Detection Settings
+detection:
+  model_path: "yolo11n.pt"           # Path to YOLO model file
+  confidence_threshold: 0.6          # Minimum confidence for detections (0.0-1.0)
+  device: "auto"                     # Device: auto, cpu, cuda
+  input_size: 640                    # Input image size for YOLO
+  max_detections: 100                # Maximum detections per frame
+
+# Object Tracking Settings  
+tracking:
+  distance_threshold: 50.0           # Maximum distance for track association (pixels)
+  confidence_threshold: 0.6          # Minimum confidence for tracking
+  max_missing_frames: 30             # Maximum frames before track deletion
+  min_track_length: 5                # Minimum track length for stability
+  merge_iou_threshold: 0.3           # IoU threshold for track merging
+  kalman_process_noise: 0.03         # Kalman filter process noise
+  kalman_measurement_noise: 0.1      # Kalman filter measurement noise
+
+# Camera Configuration
+camera:
+  camera1_id: 1                      # ID for first camera
+  camera2_id: 2                      # ID for second camera  
+  reference_camera: 2                # Reference camera for coordinate system
+  homography_path: "homography_matrix.npy"  # Path to homography matrix
+  calibration_path1: "cam1_calib.npz"       # Camera 1 calibration file
+  calibration_path2: "cam2_calib.npz"       # Camera 2 calibration file
+
+# Database Settings
+database:
+  db_path: "data/tracking_data.db"   # SQLite database path
+  auto_cleanup_days: 30              # Days to keep old sessions
+  export_format: "json"              # Export format: json, csv
+  backup_enabled: true               # Enable automatic backups
+
+# Video Processing Settings
+video:
+  output_fps: 30.0                   # Output video frame rate
+  output_codec: "mp4v"               # Video codec for output
+  output_quality: 90                 # Output video quality (1-100)
+  resize_factor: 1.0                 # Resize factor for processing
+  frame_skip: 1                      # Process every N frames
+
+# User Interface Settings
+ui:
+  window_width: 1200                 # Display window width
+  window_height: 800                 # Display window height
+  show_fps: true                     # Show FPS counter
+  show_statistics: true              # Show tracking statistics
+  overlay_opacity: 0.7               # Overlay transparency (0.0-1.0)
+
+# Logging Configuration
+logging:
+  level: "INFO"                      # Log level: DEBUG, INFO, WARNING, ERROR
+  file_path: "logs/tracking.log"     # Log file path
+  max_file_size: 10485760            # Max log file size (10MB)
+  backup_count: 5                    # Number of backup log files
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# System Paths
+data_dir: "data"                     # Data directory
+logs_dir: "logs"                     # Logs directory  
+config_dir: "config"                 # Configuration directory
+models_dir: "models"                 # Models directory
+
+# Session Settings
+session_timeout: 3600                # Session timeout (seconds)
+auto_save_interval: 300              # Auto-save interval (seconds)
